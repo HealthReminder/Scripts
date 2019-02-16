@@ -36,7 +36,7 @@ public class SoundtrackManager : MonoBehaviour {
 	}
 	
 
-
+	//Singleton pattern
 	[HideInInspector]	public static SoundtrackManager instance;
 	void Awake()	{	
 		//Make it the only one
@@ -59,6 +59,30 @@ public class SoundtrackManager : MonoBehaviour {
 		//By playing another song after the one that had finished
 		if(!audioSources[currentSource].isPlaying && currentSet != null)
 			ChangeSet(currentSet.name);
+	}
+
+	//These functions are responsable for stopping the current audio source
+	//NOT WORKING
+	public void Stop(float rate) {
+		StartCoroutine(FadeCurrentSourceOut(rate));
+	}
+	IEnumerator FadeCurrentSourceOut(float rate) {
+		float currentSourceAtStartOfCoroutine = currentSource;
+		AudioSource goingDown = audioSources[currentSource];
+		while(currentSourceAtStartOfCoroutine == currentSource){
+			while(goingDown.volume > 0 ){
+				goingDown.volume-=rate;
+				yield return null;
+			}
+			currentSet = null;
+			goingDown.Stop();
+			goingDown.volume = 0;
+			goingDown.clip = null;
+			Debug.Log ("Going down volume is "+ goingDown.volume);
+			yield break;
+		}
+
+		yield break;
 	}
 
 
