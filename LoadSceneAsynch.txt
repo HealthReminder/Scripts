@@ -1,0 +1,17 @@
+	IEnumerator LoadScene(string sceneName)
+	{
+		overlay.gameObject.SetActive(true);
+		overlay.color = new Color(0,0,0,0);
+		while(overlay.color.a < 1){
+			overlay.color+= new Color(0,0,0,0.1f);
+			yield return new WaitForSeconds(0.01f);
+		}
+        AsyncOperation loadingScene = SceneManager.LoadSceneAsync(sceneName);
+        loadingScene.allowSceneActivation = false;
+        while(!loadingScene.isDone)
+            yield return null;
+		loadingScene.allowSceneActivation = true;
+		yield return loadingScene;
+		
+		yield return null;
+	}
