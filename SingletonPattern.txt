@@ -1,0 +1,16 @@
+
+	[HideInInspector]
+	public static ThisType instance;
+	void Awake()	{	
+		//Make it the only one
+		if (instance != null)
+		{
+			Destroy(gameObject);
+		}
+		else
+		{
+			instance = this;
+			DontDestroyOnLoad(gameObject);
+		}
+		
+	}
