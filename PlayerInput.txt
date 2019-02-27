@@ -1,0 +1,45 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.Events;
+
+
+[System.Serializable]
+public class FloatEvent : UnityEvent<float>
+{
+}
+public class PlayerInput : MonoBehaviour {
+
+    [SerializeField] FloatEvent horizontalEvent, verticalEvent;
+
+    //Singleton pattern
+    [HideInInspector]
+    public static PlayerInput instance;
+    void Awake()
+    {
+        //Make it the only one
+        if (instance != null)
+        {
+            Destroy(gameObject);
+        }
+        else
+        {
+            instance = this;
+            DontDestroyOnLoad(gameObject);
+        }
+
+    }
+
+    void Update () {
+
+        if (horizontalEvent != null && Input.GetAxis("Horizontal") != 0)
+        {
+            horizontalEvent.Invoke(Input.GetAxis("Horizontal"));
+        }
+
+        if (verticalEvent != null && Input.GetAxis("Vertical") != 0)
+        {
+            verticalEvent.Invoke(Input.GetAxis("Vertical"));
+        }
+    }
+}
