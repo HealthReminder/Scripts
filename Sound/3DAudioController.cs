@@ -1,18 +1,22 @@
-using System.Collections;
+ï»¿using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Audio;
 
 [System.Serializable] public struct Sound {
     public string name;
     [Range(0.1f,1)]
     public float defaultVolume;
+    [Range(0.5f,4)]
+    public float defaultPitch;
     [Range(1,5)]
     public int minDistance;
     public AudioClip audioClip;
 }
 
-public class ThreeDAudioController : MonoBehaviour
+public class AudioController : MonoBehaviour
 {
+    public bool isInMenu = false;
     public int isOn = 0;
    [SerializeField] int sourceQuantity;
    [SerializeField] float maxListenerDistance;
@@ -21,9 +25,10 @@ public class ThreeDAudioController : MonoBehaviour
 
    List<AudioSource> audioSources;
    int currentSource;
-   [HideInInspector] public AudioListener playerListener;
+   public AudioListener playerListener;
+   public AudioMixer mixer;
 
-   [HideInInspector] public static ThreeDAudioController instance;
+   public static AudioController instance;
 	void Awake()	{	
 		//Make it the only one
 		if (instance != null)
@@ -33,13 +38,27 @@ public class ThreeDAudioController : MonoBehaviour
 		else
 		{
 			instance = this;
-			DontDestroyOnLoad(gameObject);
 		}
+
+
+        if(isInMenu){
+            playerListener = gameObject.AddComponent<AudioListener>();
+            Setup(playerListener);
+        }
 	}
+
+    public int FindSound(string soundName){
+        for (int i = 0; i < availableSounds.Length; i++)
+        {
+            if(availableSounds[i].name == soundName)
+                return(i);
+        }
+        return(-1);
+    }
 
 
    public void PlaySound(int soundIndex, Vector3 soundPos) {
-        //Checa se a posição do som é perto o suficiente do player
+        //Checa se a posiÃ§Ã£o do som Ã© perto o suficiente do player
         if(Vector3.Distance(soundPos, playerListener.transform.position) > maxListenerDistance){
             Debug.Log("Sound is too far.");
             return;
@@ -55,6 +74,8 @@ public class ThreeDAudioController : MonoBehaviour
         audioSources[currentSource].clip = availableSounds[soundIndex].audioClip;
         audioSources[currentSource].minDistance = availableSounds[soundIndex].minDistance;
         audioSources[currentSource].volume = availableSounds[soundIndex].defaultVolume;
+        audioSources[currentSource].pitch = availableSounds[soundIndex].defaultPitch; 
+        audioSources[currentSource].spatialBlend = 1;
         audioSources[currentSource].Play();
 
         currentSource++;
@@ -83,18 +104,19 @@ public class ThreeDAudioController : MonoBehaviour
            {
                GameObject newSourceObj = new GameObject("Audio Source "+i);
                audioSources.Add(newSourceObj.AddComponent<AudioSource>());
+               audioSources[i].outputAudioMixerGroup = mixer.FindMatchingGroups("Master/SFX")[0];
                newSourceObj.transform.parent = transform;
                
            }
        }
         //Reset the sources
-        for (int i = 0; i < sourceQuantity; i++)
+        /* for (int i = 0; i < sourceQuantity; i++)
         {
             audioSources[i].transform.position = new Vector3(999,999,999);
             audioSources[i].clip = null;
             audioSources[i].Stop();
             audioSources[i].spatialBlend = 1;
-        }
+        }*/
 
         playerListener = playerL;
 
