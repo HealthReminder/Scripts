@@ -1,0 +1,10 @@
+  public static string GetSomethingDotNet(string connectionString)
+    {
+        //GetSomethingDotNet("https://api.chucknorris.io/jokes/random");
+        HttpWebRequest request = (HttpWebRequest)WebRequest.Create(connectionString);
+        HttpWebResponse response = (HttpWebResponse)request.GetResponse();
+        StreamReader reader = new StreamReader(response.GetResponseStream());
+        string json = reader.ReadToEnd();
+        Debug.Log(json);
+        return json;
+    }
