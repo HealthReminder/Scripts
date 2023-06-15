@@ -43,14 +43,14 @@ public class Pooling<PoolObject> where PoolObject : Component
     {
         PoolObject obj;
 
-        if (_poolQueue.Count <= 0)
+        if (_poolQueue.Count > 0)
         {
-            return null;
 
             obj = _poolQueue.Dequeue();
             obj.transform.position = position;
             obj.transform.rotation = rotation;
             obj.gameObject.SetActive(true);
+
         }
         else
         {
