@@ -1,0 +1,1643 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using Blastworks.SlingoCasino;
+using Thanos.Logging;
+using Thanos.Events;
+using Thanos.GameHub;
+using System;
+using Blastworks.SlingoCasino.Analytics;
+using Assets.Scripts.Types;
+using ImaginationOverflow.UniversalDeepLinking;
+using UnityEngine.UI;
+using UnityEngine.CrashReportHandler;
+using System.Globalization;
+using TMPro;
+using Facebook.Unity;
+
+// This class is a controller for the lobby scene.
+//
+// Since the lobby is the very first (and currently only) scene, this controller:
+// - determines how the game initializes
+// - determines what the player first sees (the TitleDialg)
+// - handles the loading of all the buttons in the lobby
+// - co-ordinates the calls and responses made to the FacebookHandler for logging into Facebook
+// - co-ordinates the calls and responses to the App for auth
+// - updates the title dialog to let the user know what is happening.
+// - shows error dialogs if problems happen with fb login/auth or guest auth, and determines what happens next.
+// - is responsible for making calls to updates based on events that it listens for.
+public class LobbyManager : MonoBehaviour
+{
+    [SerializeField] private LoadingOverlay _loadingOverlay;
+    [SerializeField]  private TopBarManager topBarManager;
+    [SerializeField] private BottomBarManager bottomBarManager;
+    [SerializeField] private WebviewHelper webviewHelper;
+    [SerializeField] private GameObject leftBar;
+
+    private ErrorGenericDialog fatalErrorDialog = null;     // dialog for handling fatal errors.
+    private TitleDialog titleDialog;        // A reference to the titleDialog (the initial load screen) 
+                                            // We need to alter status depending on login, close when login done, etc...
+
+    private App app;
+    private bool isLobbyLoaded = false;     // a bool to track if the lobby has ever been loaded before (in this game play session)
+    public bool assetBundlesLoaded = false;
+    private float appLoadTimeInSec = 0;
+    private bool isLoadingScreenClosed = false;
+
+    private DateTime lobbyLoadStartTimestamp = DateTime.MinValue;
+    private Coroutine coroutineWinSFXLoop;
+    private Coroutine coroutineStartLobbyMusic;
+    private bool wasSoundMutedPriorToRVA = false;
+
+    //Some events wait for the lobby return to be sent
+    private bool level10LobbyEvent = false;
+    public bool bigWinLobbyEvent = false;
+    public Queue<IEvent> pendingEvents= new Queue<IEvent>();
+
+    private const string GUEST_LOGIN_FAIL_POPUP = "An error occurred while authenticating a guest login.\n Please check your connection and try again.";
+    private const string FB_LOGIN_FAIL_POPUP = "An error occurred during Facebook Login.\nPlease check your connection and try again.";
+
+    //We add a notch from iphoneX because everyting is built with that notch in mind. incase there are smaller notches later, this will compensate for it.
+    public const float IPHONEX_NOTCH = 138;
+
+    [SerializeField] private CanvasScaler popupCanvas;
+
+    public static LobbyManager Instance;
+
+    [SerializeField] private const string LIMIT_AD_ID = "00000000-0000-0000-0000-000000000000";
+
+    private List<Texture2D> loadedTextures;
+
+    public enum LoginType
+    {
+        Guest = 0,
+        Facebook = 1,
+        Apple = 2,
+        Google = 3
+    }
+
+    public LoginType CurrentLoginType { get; private set; }
+
+
+    void Awake()
+    {
+        if (Instance != null)
+        {
+            Destroy(this.gameObject);
+        }
+        else
+        {
+            Instance = this;
+        }
+        DontDestroyOnLoad(this);
+
+        if (!App.IsInitialized)
+        {
+            App.Initialize();
+        }
+        app = App.Instance;
+
+        AddAllListeners();
+
+        loadedTextures = new List<Texture2D>();
+
+#if !UNITY_WEBGL && !UNITY_FACEBOOK
+        DeepLinkManager.Instance.LinkActivated += Instance_LinkActivated;
+#endif
+#if UNITY_ANDROID || UNITY_IOS
+        Application.lowMemory += OnLowMemory;
+#endif
+    }
+
+    private void AddAllListeners()
+    {
+        EventDispatcher.AddListener(ArcadeEventType.GUEST_AUTH_ATTEMPT.ToString(), this.OnGuestAuthAttempt);
+        EventDispatcher.AddListener(ArcadeEventType.FB_CONNECT_ATTEMPT.ToString(), this.OnFBConnectAttempt);
+        EventDispatcher.AddListener(ArcadeEventType.APPLE_AUTH_ATTEMPT.ToString(), this.OnAppleConnectAttempt);
+        EventDispatcher.AddListener(ArcadeEventType.RELOAD_LOBBY_AS_GUEST.ToString(), this.OnReloadLobbyAsGuest);
+        EventDispatcher.AddListener(ArcadeEventType.RELOAD_LOBBY_AS_FB_USER.ToString(), this.OnReloadLobbyAsFacebookUser);
+        EventDispatcher.AddListener(ArcadeEventType.RELOAD_LOBBY_AS_APPLE_USER.ToString(), this.OnReloadLobbyAsAppleUser);
+        EventDispatcher.AddListener(ArcadeEventType.RELOAD_LOBBY_AS_NEW_USER.ToString(), this.OnReloadLobbyAsNewUser);
+        EventDispatcher.AddListener(ArcadeEventType.RELOAD_LOBBY_AFTER_DISCONNECT.ToString(), this.OnReloadLobbyAfterDisconnect);
+        EventDispatcher.AddListener(ArcadeEventType.USER_PROFILE_UPDATED.ToString(), this.OnUserProfileUpdated);
+        EventDispatcher.AddListener(ArcadeEventType.FB_LOGIN_SUCCESS.ToString(), this.OnFBLoginSuccess);
+        EventDispatcher.AddListener(ArcadeEventType.FB_LOGIN_FAIL.ToString(), this.OnFBLoginFail);
+        EventDispatcher.AddListener(CasinoEventType.NAVIGATION_HOME.ToString(), this.OnHomeButtonClicked);
+        EventDispatcher.AddListener(CasinoEventType.NAVIGATION_BACK_WEBVIEW.ToString(), this.OnBackButtonClicked);
+        EventDispatcher.AddListener(ArcadeEventType.RETURN_TO_LOBBY.ToString(), this.OnReturnToLobby);
+        EventDispatcher.AddListener(CasinoEventType.WEBVIEW_OPENED.ToString(), this.OnWebviewOpened);
+        EventDispatcher.AddListener(ArcadeEventType.TRIGGER_OPEN_STORE.ToString(), this.OnTriggerOpenStore);
+        EventDispatcher.AddListener(ArcadeEventType.GAME_LOADED.ToString(), this.OnGameLoaded);
+        EventDispatcher.AddListener(ArcadeEventType.DAILY_SPIN_COMPLETE.ToString(), this.OnDailySpinComplete);
+        EventDispatcher.AddListener(ArcadeEventType.POPUP_OPEN.ToString(), this.OnPopupOpen);
+        EventDispatcher.AddListener(ArcadeEventType.POPUP_CLOSE_COMPLETE.ToString(), this.OnPopupCloseComplete);
+        EventDispatcher.AddListener(ArcadeEventType.RVA_SHOW.ToString(), this.OnRVAShow);
+        EventDispatcher.AddListener(ArcadeEventType.RVA_SUCCESS.ToString(), this.OnRVASuccess);
+        EventDispatcher.AddListener(ArcadeEventType.RVA_FAIL.ToString(), this.OnRVAFail);
+        EventDispatcher.AddListener(ArcadeEventType.RVA_CLOSED.ToString(), this.OnRVAClosed);
+        EventDispatcher.AddListener(ArcadeEventType.LEVEL_UP.ToString(), OnLevelUpEvent);
+        EventDispatcher.AddListener(ArcadeEventType.CHALLENGE_PROCESSED.ToString(), this.OnChallengeProcessed);
+        EventDispatcher.AddListener(ArcadeEventType.GOOGLE_AUTH_ATTEMPT.ToString(), this.OnGoogleConnectAttempt);
+        EventDispatcher.AddListener(ArcadeEventType.DEEPLINKS_COMPLETE.ToString(), OnDeeplinkCompleted);
+        EventDispatcher.AddListener(ArcadeEventType.RELOAD_LOBBY_AS_NEW_USER.ToString(), OnReloadAsNewUser);
+
+    }
+
+
+    
+    void OnDestroy()
+    {
+        EventDispatcher.RemoveListener(ArcadeEventType.GUEST_AUTH_ATTEMPT.ToString(), this.OnGuestAuthAttempt);
+        EventDispatcher.RemoveListener(ArcadeEventType.FB_CONNECT_ATTEMPT.ToString(), this.OnFBConnectAttempt);
+        EventDispatcher.RemoveListener(ArcadeEventType.APPLE_AUTH_ATTEMPT.ToString(), this.OnAppleConnectAttempt);
+        EventDispatcher.RemoveListener(ArcadeEventType.RELOAD_LOBBY_AS_GUEST.ToString(), this.OnReloadLobbyAsGuest);
+        EventDispatcher.RemoveListener(ArcadeEventType.RELOAD_LOBBY_AS_FB_USER.ToString(), this.OnReloadLobbyAsFacebookUser);
+        EventDispatcher.RemoveListener(ArcadeEventType.RELOAD_LOBBY_AS_APPLE_USER.ToString(), this.OnReloadLobbyAsAppleUser);
+        EventDispatcher.RemoveListener(ArcadeEventType.RELOAD_LOBBY_AS_NEW_USER.ToString(), this.OnReloadLobbyAsNewUser);
+        EventDispatcher.RemoveListener(ArcadeEventType.RELOAD_LOBBY_AFTER_DISCONNECT.ToString(), this.OnReloadLobbyAfterDisconnect);
+        EventDispatcher.RemoveListener(ArcadeEventType.USER_PROFILE_UPDATED.ToString(), this.OnUserProfileUpdated);
+        EventDispatcher.RemoveListener(ArcadeEventType.FB_LOGIN_SUCCESS.ToString(), this.OnFBLoginSuccess);
+        EventDispatcher.RemoveListener(ArcadeEventType.FB_LOGIN_FAIL.ToString(), this.OnFBLoginFail);
+        EventDispatcher.RemoveListener(CasinoEventType.NAVIGATION_HOME.ToString(), this.OnHomeButtonClicked);
+        EventDispatcher.RemoveListener(CasinoEventType.NAVIGATION_BACK_WEBVIEW.ToString(), this.OnBackButtonClicked);
+        EventDispatcher.RemoveListener(ArcadeEventType.RETURN_TO_LOBBY.ToString(), this.OnReturnToLobby);
+        EventDispatcher.RemoveListener(CasinoEventType.WEBVIEW_OPENED.ToString(), this.OnWebviewOpened);
+        EventDispatcher.RemoveListener(ArcadeEventType.TRIGGER_OPEN_STORE.ToString(), this.OnTriggerOpenStore);
+        EventDispatcher.RemoveListener(ArcadeEventType.GAME_LOADED.ToString(), this.OnGameLoaded);
+        EventDispatcher.RemoveListener(ArcadeEventType.DAILY_SPIN_COMPLETE.ToString(), this.OnDailySpinComplete);
+        EventDispatcher.RemoveListener(ArcadeEventType.POPUP_CLOSE_COMPLETE.ToString(), this.OnPopupCloseComplete);
+        EventDispatcher.RemoveListener(ArcadeEventType.RVA_SHOW.ToString(), this.OnRVAShow);
+        EventDispatcher.RemoveListener(ArcadeEventType.RVA_SUCCESS.ToString(), this.OnRVASuccess);
+        EventDispatcher.RemoveListener(ArcadeEventType.RVA_FAIL.ToString(), this.OnRVAFail);
+        EventDispatcher.RemoveListener(ArcadeEventType.RVA_CLOSED.ToString(), this.OnRVAClosed);
+        EventDispatcher.RemoveListener(ArcadeEventType.LEVEL_UP.ToString(), OnLevelUpEvent);
+        EventDispatcher.RemoveListener(ArcadeEventType.GOOGLE_AUTH_ATTEMPT.ToString(), this.OnGoogleConnectAttempt);
+        EventDispatcher.RemoveListener(ArcadeEventType.DEEPLINKS_COMPLETE.ToString(), OnDeeplinkCompleted);
+        EventDispatcher.RemoveListener(ArcadeEventType.RELOAD_LOBBY_AS_NEW_USER.ToString(), OnReloadAsNewUser);
+
+#if !UNITY_WEBGL && !UNITY_FACEBOOK
+        DeepLinkManager.Instance.LinkActivated -= Instance_LinkActivated;
+#endif
+    }
+
+#if UNITY_IOS
+    public void OnAttPermissionCallback(string status)
+    {
+        bool isPermitted = bool.Parse(status);
+        ThanosLogger.Log(LogChannels.ADS, this + ".OnAttPermissionCallback set to: " + status + ".");
+    }
+#endif
+
+    private void Instance_LinkActivated(LinkActivation deeplink)
+    {
+        URLHandler.Instance.SpecializedDeeplinkHandler(deeplink.Uri);
+    }
+
+    // This will trigger slot machine sfx, it should only 
+    private IEnumerator TriggerWinSFX()
+    {
+        while (true)
+        {
+            float delay = UnityEngine.Random.Range(13.0f, 22.0f);
+            yield return new WaitForSeconds(delay);
+            AudioManager.Instance.PlaySound(AudioId.SFX_LOBBY_JACKPOT2);
+        }
+    }
+
+    private void OnDeeplinkCompleted(IEvent evt)
+    {
+        EventDispatcher.RemoveListener(ArcadeEventType.DEEPLINKS_COMPLETE.ToString(), OnDeeplinkCompleted);
+        StartCoroutine(TriggerIAMReadyEvent());
+    }
+
+    private void OnReloadAsNewUser(IEvent evt)
+    {
+        EventDispatcher.AddListener(ArcadeEventType.DEEPLINKS_COMPLETE.ToString(), OnDeeplinkCompleted);
+    }
+
+    private IEnumerator TriggerIAMReadyEvent()
+    {
+        yield return new WaitForSeconds(1f);
+        while (IsReturnToLobbyPossible() || PopupManager.Instance.GetActiveDialogCount() > 0)
+        {
+            yield return null;
+        }
+        ArcadeAnalyticsManager.Instance.DispatchMarketingTrigger(ArcadeAnalyticsEvent.IAM_READY_EVENT);
+    }
+
+
+    /// <summary>
+    /// Just the way the loading screen is set up, we cannot attach a "popupclosed" event to it because it doenst trigger.
+    /// </summary>
+    public void SetLoadingScreenClosed()
+    {
+        isLoadingScreenClosed = true;
+    }
+
+    // Use this for initialization
+    //Here the user is authenticated and then the server config values are fetched at the same time
+    void Start()
+    {
+        this.SetupScene();
+
+        // Load the config before setting anything in motion
+        this.titleDialog.SetStatusText("Loading");
+        app.FetchServerConfig(this.OnFetchServerConfigSuccess, this.OnFetchServerConfigFail);
+        //StartCoroutine(FetchAndParseMachineIconInfo());
+    }
+
+    private void OnFetchServerConfigSuccess()
+    {
+        this.titleDialog.SetStatusText("Waiting for Facebook initialization");
+        FacebookHandler.Instance.Initialize();
+    }
+
+    private void OnFetchServerConfigFail(string errorMessage)
+    {
+        Debug.LogError(this + ".OnFetchServerConfigFail: " + errorMessage + ". Resend the request.");
+
+        // report an error - we can't really run without the config!
+        // put up a dialog to tell the user that the config couldn't be read.
+        // when it has finished closing - the app will be reloaded.
+        var dialogData = new ErrorGenericDialogData
+        {
+            Body = "An error occurred while reading configuration files. \n Please close the app and try again.\n" + errorMessage
+        };
+        fatalErrorDialog = PopupManager.Instance.CreatePopup(DialogName.ERROR_GENERIC, dialogData).GetComponent<ErrorGenericDialog>();
+    }
+
+    private void OnPopupCloseComplete(IEvent evt)
+    {
+        PopupManager.PopupCloseCompleteEvent evt2 = evt as PopupManager.PopupCloseCompleteEvent;
+        // if the fatal error dialog was closed,  we will quit the app.
+        if (evt2.dialog == this.fatalErrorDialog)
+        {
+            fatalErrorDialog = null;
+            Application.Quit();
+        }
+    }
+
+    private void OnPopupOpen(IEvent evt)
+    {
+        var typedEvt = evt as PopupManager.PopupOpenEvent;
+        // if the fatal error dialog was closed,  we will quit the app.
+        if (typedEvt.dialog.DialogName == DialogName.CASINO_DAILY_SPIN)
+        {
+            this.StopLobbySounds();
+        }
+    }
+
+    private void SetupScene()
+    {
+        // Bring up the title dialog
+        this.titleDialog = this.ShowInitialTitleDialog();
+
+        SetupPopupCanvasScale();
+
+        // Wait for the FacebookHandler to initialize. (in theory this will never have been initialized this point - it's just here as a safety)
+        if (!FacebookHandler.Instance.IsInitialized)
+        {
+            EventDispatcher.AddListener(ArcadeEventType.FB_INIT_COMPLETE_ATTEMPT.ToString(), this.OnFBInitComplete);    // listen for FB init
+        }
+    }
+
+    // Show the title dialog for the first time in the session
+    //
+    // Expected flow:
+    // When this is called, we don't EXPECT that we will know what state the FacebookHandler is in (because we EXPECT that it hasn't been 
+    // initialized yet).  So we will plan to show the TitleDialog without any buttons, and then wait for an event to tell us that the
+    // FacebookHandler has initialized and we can then query it to find out what to do.
+    //
+    // Edge case flow:
+    // The FacebookHandler could theoretically have been initialized before this method is called (doubtful though),
+    // but just in case - we determine the look of the dialog that would result from being logged in or not.
+
+    private TitleDialog ShowInitialTitleDialog()
+    {
+        // Determine what the titleDialog should look like & do
+        // We don't know at this point if FB has been initialized or not, or if it is - if we are logged in - so there are several paths
+        var loginType = TitleDialog.LoginTypes.ShowLoginChoice;
+
+        if (PlayerPrefs.HasKey(AppleSignInPreserver.USER_ID))
+        {
+            loginType = TitleDialog.LoginTypes.AutoLoginAsAppleUser;
+        }
+        else if (!FacebookHandler.Instance.IsInitialized)
+        {
+            loginType = TitleDialog.LoginTypes.HideLoginChoice;     // if FB not initialized, just show a blank screen, we'll wait for initComplete and then decide what to do.
+        }
+        else if (FacebookHandler.Instance.IsInitialized)         // FB initialized & logged in
+        {
+            loginType = TitleDialog.LoginTypes.AutoLoginAsFBUser;
+        }
+        else if (CurrentLoginType == LoginType.Guest)
+        {
+            loginType = TitleDialog.LoginTypes.AutoLoginAsGuest;
+        }
+        else                                                    
+        {
+            loginType = TitleDialog.LoginTypes.ShowLoginChoice;
+        }
+
+        // Bring up the title dialog      
+        var dialogData = new TitleDialogData(loginType);
+        var dialog = PopupManager.Instance.CreatePopup(DialogName.TITLE, dialogData);
+
+        // start the home button off as being disabled
+        //this.topBarManager.SetHomeButtonInteractable(false);
+
+        return dialog.GetComponent<TitleDialog>();
+    }
+
+
+    // Called when the FacebookHandler has been initialized, and determines what sort of login is going to be presented
+    // based on whether the FacebookHandler succeeded it's initialization, and whether the player is logged in.
+    private void OnFBInitComplete(IEvent evt)
+    {
+        var typedEvt = evt as FacebookEvents.FBInitCompleteEvent;
+        EventDispatcher.RemoveListener(ArcadeEventType.FB_INIT_COMPLETE_ATTEMPT.ToString(), OnFBInitComplete);     // stop listening for FB init
+
+        StartCoroutine(ResolveInitialization(typedEvt.success));
+    }
+
+    private IEnumerator ResolveInitialization(bool success)
+    {
+        // wait until the server config is valid
+        while (App.Instance.CasinoConfig == null)
+        {
+            this.titleDialog.SetStatusText("Searching for config...");
+            yield return null;
+        }
+
+        if (PopupManager.Instance.GetActiveDialog(DialogName.FORCED_UPDATE) != null)
+        {
+            yield break;
+        }
+
+        // If the Facebook handler initialized without error
+        if (success)
+        {
+#if UNITY_WEBGL
+            titleDialog.AutoLoginAsFbUser();
+#else
+            // Start the FBUser Login/Auth sequence if the FacebookHandler says we are logged in.
+            if (FacebookHandler.Instance.IsInitialized)
+            {
+                titleDialog.AutoLoginAsFbUser();
+            }
+            else    // if we're not logged it, give the player a choice of guest or FB connect.
+            {
+                titleDialog.ShowActionButtons();
+            }
+#endif
+        }
+        else   // Facebook failed to init, give the player a choice of guest or FB connect
+        {
+            titleDialog.ShowActionButtons();
+        }
+
+        // send the app_load event (co-incides with the title screen showing the login buttons)
+        ArcadeAnalyticsManager.Instance.DispatchAppLoadEndEvent();
+    }
+
+    // Called if either a guest or a FB auth completes
+    private void AuthCompleted()
+    {
+        EventDispatcher.TriggerEvent(new AuthenticateCompleteEvent());  // Tells the store manager that it can go ahead and load the store
+        //enable bottom bar
+        this.bottomBarManager.UnhideBottomBar();
+
+#if UNITY_IOS
+        if(Thanos.Core.AppInfo.DeviceAdvertisingIdentifier == LIMIT_AD_ID)
+        {
+            // Update the ad id in Backoffice
+            var advertRequest = new GameService.UserAPI.AdvertIdRequest()
+            {
+                userId = App.Instance.UserInfo.ID,
+                hash = App.Instance.AuthHash,
+                advertId = Thanos.Core.App.GetUniqueAppKey(DateTime.Now.Ticks)
+            };
+
+            App.Instance.GameService.User.UpdateAdvertId(advertRequest, AdvertIdChanged, AdvertIdChangeFailure);
+        }
+#endif
+
+        app.FetchUserData();
+        app.MarketingLogin();
+        ArcadeAnalyticsManager.Instance.DispatchLoginEvent(CurrentLoginType);
+
+        // Unity crash reporting custom meta data
+        CrashReportHandler.SetUserMetadata("userId", App.Instance.UserInfo.ID);
+
+        this.isLobbyLoaded = false;
+        StartCoroutine(FinalizeAuthProcess());
+    }
+
+
+    private void AdvertIdChangeFailure(IAsyncResult result, string error)
+    {
+        ArcadeAnalyticsManager.Instance.DispatchUserChangedAdvertIDs(error, false);
+    }
+
+    private void AdvertIdChanged(IAsyncResult result, GameService.UserAPI.AdvertIdResponse response)
+    {
+        ArcadeAnalyticsManager.Instance.DispatchUserChangedAdvertIDs(response.Msg, true);
+    }
+
+
+    // ---------------------------------------------------------------------------
+    // GUEST AUTH
+    // Connecting as a guest is a simple 1 step process.
+    //  - authenticate the guest user with the game server.
+    //
+    // If this fails, we will need to abort this process, put up an error dialog, and put
+    // the player back in a state where they can choose to attempt to login again (either via facebook or the guest button).
+    // ---------------------------------------------------------------------------
+    // triggered by clicking the titlePanel "Play as Guest" button.
+    private void OnGuestAuthAttempt(IEvent evt)
+    {
+        this.titleDialog.SetStatusText("Authorizing player as guest");
+        App.Instance.AuthenticateAsGuest(this.OnGuestAuthSuccess, this.OnGuestAuthFail);
+    }
+
+    /// <summary>
+    /// User data is fetched after authentication as we need the auth hash to fetch user data
+    /// Authenticate completed event is fired to load the store, for same reason as above
+    /// Lobby is also loaded
+    /// </summary>
+    private void OnGuestAuthSuccess()
+    {
+        ThanosLogger.Log(LogChannels.LOBBY, this + ".OnGuestAuthSuccess()");
+        CurrentLoginType = LoginType.Guest;
+        ArcadeAnalyticsManager.Instance.DispatchLoginEvent(ArcadeAnalyticsEvent.LOGIN_ACTION_GUEST);
+
+        this.titleDialog.SetStatusText("Guest auth successful.");
+        //this.topBarManager.ClearPlayerIcon();
+        this.AuthCompleted();
+    }
+
+
+    /// <summary>
+    /// Triggered when a guest auth fails
+    /// </summary>
+    /// <param name="errorMessage"></param>
+    private void OnGuestAuthFail(string errorMessage)
+    {
+        ThanosLogger.Log(LogChannels.LOBBY, this + ".OnGuestAuthFail(): " + errorMessage);
+
+        if (titleDialog != null)
+        {
+            this.titleDialog.SetStatusText("Guest auth failed.");
+        }
+
+        ThanosLogger.Error(errorMessage);
+
+        this.ShowLoginFailDialog(GUEST_LOGIN_FAIL_POPUP);
+
+        // clear the status text
+        this.titleDialog.SetStatusText("");
+
+        // Make it so the title screen buttons are active again.
+        this.titleDialog.ShowActionButtons();
+    }
+
+    // ---------------------------------------------------------------------------
+    // FACEBOOK CONNECT (LOGIN / AUTH)
+    //
+    // Connecting a facebook user is a 2 step process
+    //  1) logging into Facebook successfully.
+    //  2) using the info from step 1 to authenticate the facebook user with the game server.
+    //
+    // If either one of these steps fails, we will need to abort the process, put up an error dialog, and put
+    // the player back in a state where they can choose to attempt to login again (either via facebook, or the guest button)
+    // ---------------------------------------------------------------------------
+
+    // Connect implies it will determine whether to login & auth, or just auth
+    private void OnFBConnectAttempt(IEvent evt)
+    {
+        CurrentLoginType = LoginType.Facebook;
+        // FB Connect Attempt
+        if (FacebookHandler.Instance != null && FacebookHandler.Instance.IsLoggedIn)
+        {
+            // attempt to auth the existing FB session
+            ThanosLogger.Log(LogChannels.LOBBY, "[Lobby] Facebook Login Button was clicked. Player is already logged in. Refreshing Access Token.");
+            FB.Mobile.RefreshCurrentAccessToken(OnFBRefreshTokenComplete);
+        }
+        else
+        {
+            // we need to login to FB as a first step
+            ThanosLogger.Log(LogChannels.LOBBY, "[Lobby] Facebook Login Button was clicked. Player is not logged in. Attempting login.");
+            this.FBLoginAttempt();
+        }
+    }
+
+    private void OnFBRefreshTokenComplete(IAccessTokenRefreshResult result)
+    {
+        //  There is an existing FB session - create and pack a fbInfo object (from the existing FB session access token) and try to auth it.
+        var fbInfo = new GameService.UserAPI.AuthRequest.FacebookInfo
+        {
+            UserId = Facebook.Unity.AccessToken.CurrentAccessToken.UserId,
+            AccessToken = Facebook.Unity.AccessToken.CurrentAccessToken.TokenString,
+            SignedRequest = "",
+            ExpiresIn = (long)TimeSpan.FromTicks(Facebook.Unity.AccessToken.CurrentAccessToken.ExpirationTime.Ticks).TotalMinutes,
+        };
+        ThanosLogger.Log(LogChannels.LOBBY, "[Lobby] Facebook Access Token was refreshed. Attempting authentication.");
+        // attempt to auth the existing FB session
+        this.FBAuthAttempt(fbInfo);
+    }
+
+
+    // Attempt to connect with facebook & get authenticated by the server.
+    // This is triggered when a FBConnectAttemptEvent is dispatched (when FBConnect is clicked on the title panel)
+    private void FBLoginAttempt()
+    {
+        this.titleDialog.SetStatusText("Connecting with Facebook");
+        FacebookHandler.Instance.LoginToFacebook(null); //, this.OnFBLoginSuccess, this.OnFBLoginFail);
+    }
+
+
+    // triggered by a successful facebook login and auth
+    private void OnFBLoginSuccess(IEvent evt) //GameService.UserAPI.AuthRequest.FacebookInfo fbInfo)
+    {
+        FacebookEvents.FBLoginSuccessEvent fbLoginSuccessEvent = evt as FacebookEvents.FBLoginSuccessEvent;
+        this.titleDialog.SetStatusText("Facebook login successful.");
+
+        this.FBAuthAttempt(fbLoginSuccessEvent.fbInfo);
+    }
+
+
+    // triggered by a failed Facebook login/auth
+    private void OnFBLoginFail(IEvent evt) //bool wasCancelled, string failureReason)
+    {
+        FacebookEvents.FBLoginFailEvent failEvt = evt as FacebookEvents.FBLoginFailEvent;
+        if (failEvt.cancelled) //wasCancelled)
+        {
+            ThanosLogger.Log(LogChannels.LOBBY,"FBLogin.OnLoginFail - the User cancelled. " + failEvt.errorMsg);
+        }
+        else
+        {
+            ThanosLogger.Error("FBLogin.OnLoginFail - The user did not cancel, error: " + failEvt.errorMsg);
+        }
+
+        // show a dialog explaining the failure.
+        this.ShowLoginFailDialog(FB_LOGIN_FAIL_POPUP);
+
+        // clear the status text
+        this.titleDialog.SetStatusText("");
+
+        // Make it so the title screen buttons are active again, so we can retry
+        this.titleDialog.ShowActionButtons();
+    }
+
+
+    // Show an error dialog to tell the player that the Facebook login/auth failed.
+    private void ShowLoginFailDialog(string body)
+    {
+        ErrorGenericDialogData dialogData = new ErrorGenericDialogData
+        {
+            Body = body
+        };
+        PopupManager.Instance.CreatePopup(DialogName.ERROR_GENERIC, dialogData);
+    }
+
+
+    // ---------------------------------------------------------------------------
+    // FACEBOOK AUTH 
+    // ---------------------------------------------------------------------------
+
+    // Attempt to auth the facebookInfo object passed in with the game server
+    private void FBAuthAttempt(GameService.UserAPI.AuthRequest.FacebookInfo fbInfo)
+    {
+        if (titleDialog != null)
+        {
+            this.titleDialog.SetStatusText("Authenticating Facebook user");
+        }
+        App.Instance.AuthenticateAsFBAccount(fbInfo, this.OnFBAuthSuccess, this.OnFBAuthFail);
+    }
+
+
+    private void OnFBAuthSuccess()
+    {
+        ThanosLogger.Log(LogChannels.AUTH, "GameServiceLoginSuccess AUTH success ||| " + App.Instance.UserInfo.ID + " " + App.Instance.UserInfo.Username);
+
+        ArcadeAnalyticsManager.Instance.DispatchLoginEvent(ArcadeAnalyticsEvent.LOGIN_ACTION_FB);
+
+        //FacebookHandler.Instance.FetchProfilePicUrl();
+
+        // continue on our way
+        this.AuthCompleted();
+    }
+
+    private void OnAppleConnectAttempt(IEvent evt)
+    {
+#if !UNITY_WEBGL
+        CurrentLoginType = LoginType.Apple;
+        var typedEvt = evt as AppleConnectAttemptEvent;
+
+        var appleInfo = new GameService.UserAPI.AuthRequest.AppleInfo
+        {
+            displayName = typedEvt.name,
+            email = typedEvt.email,
+            idToken = typedEvt.idtoken,
+            appleId = typedEvt.appleId,
+            authCode = typedEvt.authcode
+        };
+        ThanosLogger.Log(LogChannels.AUTH, "OnAppleConnectAttempt " + appleInfo.appleId.ToString());
+        // attempt to auth the existing Apple session
+        StartCoroutine(AppleAuthAttempt(appleInfo));
+#endif
+    }
+
+    private void OnGoogleConnectAttempt(IEvent evt)
+    {
+#if UNITY_ANDROID
+        CurrentLoginType = LoginType.Google;
+        var typedEvt = evt as GoogleConnectAttemptEvent;
+        var user = typedEvt.user;
+        var googleInfo = new GameService.UserAPI.AuthRequest.GoogleInfo
+        {
+            displayName = user.DisplayName,
+            email = user.Email,
+            idToken = typedEvt.token,
+            userId = user.UserId
+        };
+
+        ThanosLogger.Log(LogChannels.AUTH, "OnGoogleConnectAttempt: " + googleInfo.displayName + " " + googleInfo.email + " " + googleInfo.userId);
+
+        // attempt to auth the existing FB session
+        this.GoogleAuthAttempt(googleInfo);
+#endif
+    }
+
+
+    private void GoogleAuthAttempt(GameService.UserAPI.AuthRequest.GoogleInfo googleInfo)
+    {
+        if (titleDialog != null)
+        {
+            this.titleDialog.SetStatusText("Authenticating with Google Services");
+        }
+        App.Instance.AuthenticateWithGoogle(googleInfo, OnGoogleAuthSuccess, OnGoogleAuthFailure);
+    }
+
+    private void OnGoogleAuthSuccess()
+    {
+        ThanosLogger.Log(LogChannels.AUTH, "GameServiceLoginSuccess AUTH success ||| " + App.Instance.UserInfo.ID + " " + App.Instance.UserInfo.Username);
+
+        ArcadeAnalyticsManager.Instance.DispatchLoginEvent(ArcadeAnalyticsEvent.LOGIN_ACTION_GOOGLE);
+        //this.topBarManager.ClearPlayerIcon();
+
+        // continue on our way
+        this.AuthCompleted();
+    }
+
+    private void OnGoogleAuthFailure(string errorMsg)
+    {
+        ThanosLogger.Log(LogChannels.AUTH, this + ".OnGoogleAuthFailure " + errorMsg);
+        this.ShowGoogleAuthFailDialog(errorMsg);
+        //// clear the status text
+        this.titleDialog.SetStatusText("");
+
+        //// Make it so the title screen buttons are active again, so we can retry
+        this.titleDialog.ShowActionButtons();
+    }
+    private void ShowGoogleAuthFailDialog(string msgFail)
+    {
+        ErrorGenericDialogData dialogData = new ErrorGenericDialogData
+        {
+            Body = "An error occurred while authenticating with Google.\n[" + msgFail + "]\n"
+        };
+
+        DisplayErrorDialog(dialogData);
+    }
+    private IEnumerator AppleAuthAttempt(GameService.UserAPI.AuthRequest.AppleInfo appleInfo)
+    {
+        if(titleDialog != null)
+        {
+            this.titleDialog.SetStatusText("Authenticating to Apple Services");
+        }
+
+        while(App.Instance.CasinoConfig == null)
+        {
+            yield return null;
+        }
+
+        if(PopupManager.Instance.GetActiveDialog(DialogName.FORCED_UPDATE) != null)
+        {
+            yield break;
+        }
+
+        App.Instance.AuthenticateWithApple(appleInfo, OnAppleAuthSuccess, OnAppleAuthFailure);
+    }
+
+    private void OnAppleAuthSuccess()
+    {
+        ThanosLogger.Log(LogChannels.AUTH, "GameServiceLoginSuccess AUTH success ||| " + App.Instance.UserInfo.ID + " " + App.Instance.UserInfo.Username);
+
+        ArcadeAnalyticsManager.Instance.DispatchLoginEvent(ArcadeAnalyticsEvent.LOGIN_ACTION_APPLE);
+        //this.topBarManager.ClearPlayerIcon();
+
+        // continue on our way
+        this.AuthCompleted();
+    }
+
+    private void OnAppleAuthFailure(string errorMsg)
+    {
+        ThanosLogger.Log(LogChannels.AUTH, this + ".OnAppleAuthFailure " + errorMsg);
+        this.ShowAppleAuthFailDialog(errorMsg);
+        //// clear the status text
+        this.titleDialog.SetStatusText("");
+
+        //// Make it so the title screen buttons are active again, so we can retry
+        this.titleDialog.ShowActionButtons();
+    }
+
+    /// <summary>
+    /// 
+    /// </summary>
+    /// <param name="msgFail"></param>
+    private void OnFBAuthFail(string msgFail)
+    {
+        ThanosLogger.Log(LogChannels.AUTH, this + ".OnFBAuthFail:: " + msgFail);
+
+        // show a dialog to indicate the failure
+        this.ShowFBAuthFailDialog(msgFail);
+
+        // If we got through the first step of logging into Facebook (before we failed authentication),
+        // We need to logout before telling the player the whole thing failed.
+        FacebookHandler.Instance.LogOut();
+        
+
+        // clear the status text
+        this.titleDialog.SetStatusText("");
+
+        // Make it so the title screen buttons are active again, so we can retry
+        this.titleDialog.ShowActionButtons();
+    }
+
+    private void ShowAppleAuthFailDialog(string msgFail)
+    {
+        ErrorGenericDialogData dialogData = new ErrorGenericDialogData
+        {
+            Body = "An error occurred while authenticating with Apple.\n[" + msgFail + "]\n"
+        };
+
+        DisplayErrorDialog(dialogData);
+    }
+
+    // Show an error dialog to indicate a failed Facebooth auth
+    private void ShowFBAuthFailDialog(string msgFail)
+    {
+        ErrorGenericDialogData dialogData = new ErrorGenericDialogData
+        {
+            Body = "An error occurred while authenticating Facebook user.\n[" + msgFail + "]\n"
+        };
+
+        DisplayErrorDialog(dialogData);
+    }
+
+    private void DisplayErrorDialog(ErrorGenericDialogData data)
+    {
+        if (data.Body.ToLower().Contains("internet"))
+        {
+            data.Body += "Please refresh browser";
+        }
+        else
+        {
+            data.Body += "Please try again";
+        }
+        PopupManager.Instance.CreatePopup(DialogName.ERROR_GENERIC, data);
+    }
+
+
+    // Loads the lobby.
+    public IEnumerator FinalizeAuthProcess()
+    {
+        if (AssetBundleManager.Instance.IsDownloadPermissionNeeded())
+        {
+            while (AssetBundleManager.Instance.versionDetails.Count == 0)
+            {
+                this.titleDialog.SetStatusText("Looking for games....");
+                yield return null;
+            }
+            titleDialog.SetStatusText("Waiting for permission...");
+            PopupManager.Instance.CreatePopup(DialogName.DOWNLOAD_REQUEST, new BasicGenericDialogData(), false);
+            while(PopupManager.Instance.GetActiveDialog(DialogName.DOWNLOAD_REQUEST))
+            {
+                yield return null;
+            }
+            AssetBundleManager.Instance.StartAssetDownload();
+        }
+
+        titleDialog.SetStatusText("Updating new avatars...");
+        yield return StartCoroutine(ProfileController.Instance.DownloadAvatars());
+        yield return StartCoroutine(LoadLobby());
+        App.Instance.ConnectionHelper.ConnectSocket();
+
+        while (!App.Instance.ConnectionHelper.IsSocketConnected() || PopupManager.Instance.GetActiveDialog(DialogName.NEW_LOADING_SCREEN) != null)
+        {
+            yield return null;
+        }
+        ArcadeAnalyticsManager.Instance.DispatchGraphDataEvent();
+
+        OnLoadLobbyComplete();
+    }
+
+    private IEnumerator LoadLobby()
+    {
+        var assets = AssetBundleManager.Instance;
+        this.titleDialog.SetStatusText("Setting up avatars");
+        ProfileController.Instance.SetUpAvatars();
+        ProfileController.Instance.SetUserAvatar(CurrentLoginType);
+        LoyaltyController.Instance.SetupLoyalty();
+
+        // only load the lobby if it hasn't been loaded before
+        if (!this.isLobbyLoaded)
+        {
+            this.lobbyLoadStartTimestamp = DateTime.Now;
+            if (titleDialog != null)
+            {
+                this.titleDialog.SetStatusText("Loading lobby");
+            }
+            StartCoroutine(CheckUpdateConsecutiveDays());
+
+            if (titleDialog != null)
+            {
+                this.titleDialog.SetStatusText("Loading assets");
+            }
+
+            while (!assets.areInitialIconsloaded || !assets.areFTUEAssetsLoaded || !assets.areMainLobbyIconsLoaded 
+                || !assets.areEventAssetsLoaded || !assets.areSublobbyThemeAssetsLoaded)
+            {
+                yield return null;
+            }
+
+            //if not a new USER
+            if (App.Instance.GameService.KeyValueStore.UserDataDict.ContainsKey(UserDataKeys.TUTORIAL))
+            {
+                while (!assets.areRemainingIconsloaded)
+                {
+                    yield return null;
+                }
+            }
+        }
+        yield return null;
+    }
+
+    /// <summary>
+    /// Allows a game to be loaded by passing the name of the game as it appears in backoffice (Note: use Name, not Title).
+    /// </summary>
+    /// <param name="gameName">The name of the game in Backoffice to be launched.</param>
+    /// <param name="currentLobby">Where the game is being launched from.</param>
+    public bool LoadGame(string gameName, string currentLobby)
+    {
+        return webviewHelper.LaunchGameFromName(gameName, currentLobby);
+    }
+
+    /// <summary>
+    /// Opening this up because this needs to be called early in case of spin games showing the store and reloading in the background because race conditions.
+    /// </summary>
+    public void DestroyGame(bool handleNavWidget)
+    {
+        webviewHelper.DestroyGame(handleNavWidget);
+    }
+
+
+    // Triggered when the lobby is finished loading (or if the load has been skipped).
+    private void OnLoadLobbyComplete()
+    {
+        this.isLobbyLoaded = true;
+
+        // report the lobby load time (but only do it the first time in the session)
+        if (this.lobbyLoadStartTimestamp != DateTime.MinValue)
+        {
+            TimeSpan lobbyLoadTimeSpan = DateTime.Now.Subtract(this.lobbyLoadStartTimestamp);
+            ThanosLogger.Log(LogChannels.LOBBY, "lobbyLoadTimeSpan:" + lobbyLoadTimeSpan.TotalSeconds.ToString());
+            // our lobby load is considered to be our app load, plus the time that it takes after the guest/fb auth to the time when the lobby buttons are all loaded.
+            double lobbyLoadTimeInSec = this.appLoadTimeInSec + lobbyLoadTimeSpan.TotalSeconds;
+            StartCoroutine(ArcadeAnalyticsManager.Instance.DispatchLobbyLoadEvent(lobbyLoadTimeInSec));
+            this.lobbyLoadStartTimestamp = DateTime.MinValue;
+        }
+
+        //Check if FTUE is needed
+       StartCoroutine(CheckTutorialStatus());
+
+        // remove the titleDialog
+        this.titleDialog.SetStatusText("");
+        this.titleDialog.Close();
+        this.titleDialog = null;
+    }
+    
+    private void AttemptToShowDailySpin()
+    {
+        StartCoroutine(DailySpinManager.getInstance().AttemptToShowDailySpinDialog());
+    }
+
+    IEnumerator CheckTutorialStatus()
+    {
+        while (!App.Instance.isUserDataLoaded)
+        {
+            yield return null;
+        }
+        bool tutorialPlayed = false;
+        if (App.Instance.GameService.KeyValueStore.UserDataDict.ContainsKey(UserDataKeys.TUTORIAL))
+        {
+            tutorialPlayed = true;
+        }
+
+        if (!tutorialPlayed)
+        {
+            var dialogData = new LobbyFTUEDialogData
+            {
+                pages = LobbyFTUEManager.Instance.LobbyFTUEPages
+            };
+            if (dialogData.pages.Count == 0)
+            {
+                ThanosLogger.Error("Missing FTUE Assets missing therefore skipping FTUE");
+                AttemptToShowDailySpin();
+            }
+            else
+            {
+                PopupManager.Instance.CreatePopup(DialogName.LOBBY_FTUE, dialogData, true, AttemptToShowDailySpin);
+            }
+        }
+        else
+        {
+            AttemptToShowDailySpin();
+        }
+    }
+
+    // Updates consecutive days at midnight while active session
+    private IEnumerator CheckUpdateConsecutiveDays()
+    {
+        //Change to use config for testing
+        var resetlocalTime = TimeSpan.Parse(App.Instance.CasinoConfig.cache.ConsDayResetLocaltime, CultureInfo.InvariantCulture); //DateTime.Today.AddDays(1).TimeOfDay;
+
+        while (true)
+        {
+            if (DateTime.Now.TimeOfDay >= resetlocalTime && DateTime.Now.TimeOfDay <= resetlocalTime.Add(new TimeSpan(0,0,10)))
+            {
+                App.Instance.UpdateConsDays(OnUpdateConsDaysSuccess, OnUpdateConsDaysFailure);
+                yield return new WaitForSeconds(15);
+            }
+            else
+            {
+                yield return new WaitForSeconds(10);
+            }
+        }
+    }
+
+    private void OnUpdateConsDaysSuccess()
+    {
+        ThanosLogger.Log(LogChannels.EVENT, "User updated consecutive days at local time: " + DateTime.Now.TimeOfDay.ToString());
+        // Queue daily bonus for when returned to lobby
+        StartCoroutine(DailySpinManager.getInstance().AttemptToShowDailySpinDialog());
+    }
+    private void OnUpdateConsDaysFailure(string response)
+    {
+        ThanosLogger.Error("User could not update consecutive days: " + response);
+    }
+
+    public Coroutine StartTimer(DateTime expireTime, TextMeshProUGUI timerText =  null, GameObject timerBox = null)
+    {
+        return StartCoroutine(TimerRoutine(expireTime, timerText, timerBox));
+    }
+
+    public void StopTimer(Coroutine timer)
+    {
+        StopCoroutine(timer);
+    }
+
+    private IEnumerator TimerRoutine(DateTime expireTime, TextMeshProUGUI timerText, GameObject timerBox)
+    {
+        var timeLeft = expireTime - DateTime.Now;
+        while (timeLeft.TotalSeconds >= 0)
+        {
+            timeLeft = expireTime - DateTime.Now;
+            if(timerText != null)
+            {
+                timeLeft = expireTime - DateTime.Now;
+                if (timeLeft.Days > 1)
+                {
+                    timerText.text = timeLeft.Days + " Days Left";
+                }
+                else if (timeLeft.Days == 1)
+                {
+                    timerText.text = timeLeft.Days + " Day Left";
+                }
+                else
+                {
+                    timerText.text = string.Format("{0:00}h:{1:00}m:{2:00}s", timeLeft.Hours, timeLeft.Minutes, timeLeft.Seconds);
+                }
+            }
+            yield return null;
+        }
+        if(timerBox != null)
+        {
+           timerBox.SetActive(false); 
+        }
+        //reload lobby buttons
+        EventDispatcher.TriggerEvent(new GameListUpdatedEvent());
+    }
+
+    public bool IsWebviewActive()
+    {
+        return webviewHelper.IsWebviewActive();
+    }
+
+    private IEnumerator StartLobbyMusic()
+    {
+        if (!webviewHelper.IsWebviewActive())
+        {
+            ThanosLogger.Log(LogChannels.LOBBY, this + ".StartLobbyMusic()");
+            yield return new WaitForSeconds(3.5f);
+            // make sure this coroutine is not already running.
+            if (coroutineWinSFXLoop != null)
+            {
+                this.StopCoroutine(this.coroutineWinSFXLoop);
+                coroutineWinSFXLoop = StartCoroutine(TriggerWinSFX());
+            }
+            else
+            {
+                coroutineWinSFXLoop = StartCoroutine(TriggerWinSFX());
+            }
+
+            AudioManager.Instance.PlaySound(AudioId.AMBIENCE_LOBBY);
+            if (!AudioManager.Instance.isPlaying(AudioId.MUSIC_LOBBY))
+            {
+                AudioManager.Instance.PlaySound(AudioId.MUSIC_LOBBY);
+            }
+            yield return new WaitForSeconds(3.5f);
+        }
+        else
+        {
+            ThanosLogger.Log(LogChannels.LOBBY, this + ".StartLobbyMusic(): didnt start lobby music because webview is active");
+        }
+    }
+
+
+    public void StopLobbySounds()
+    {
+        ThanosLogger.Log(LogChannels.LOBBY, this + ".StopLobbySounds()");
+        AudioManager.Instance.StopSound(AudioId.MUSIC_LOBBY);
+        AudioManager.Instance.StopSound(AudioId.AMBIENCE_LOBBY);
+        AudioManager.Instance.StopSound(AudioId.SFX_LOBBY_JACKPOT2);
+        if (coroutineWinSFXLoop != null)
+        {
+            StopCoroutine(this.coroutineWinSFXLoop);
+            coroutineWinSFXLoop = null;
+        }
+        if (coroutineStartLobbyMusic != null)
+        {
+            StopCoroutine(coroutineStartLobbyMusic);
+            coroutineStartLobbyMusic = null;
+        }
+    }
+
+
+    private void StartLobbySoundsAfterReturnFromMachine()
+    {
+        ThanosLogger.Log(LogChannels.LOBBY, this + ".StartLobbySoundsAfterReturnFromMachine()");
+
+        if(coroutineStartLobbyMusic == null)
+        {
+            coroutineStartLobbyMusic = StartCoroutine(StartLobbyMusic());
+        }
+    }
+
+
+    /// <summary>
+    /// Called when either the daily spin dialog fails to load or it is done closing. If there is no FTUE required, check to handle any deeplinks
+    /// </summary>
+    /// <param name="evt"></param>
+    void OnDailySpinComplete(IEvent evt)
+    {
+        coroutineStartLobbyMusic = StartCoroutine(StartLobbyMusic());
+        AudioManager.Instance.PlaySound(AudioId.SFX_GAME_LAUNCH);
+        InboxManager.Instance.GetNewMessages(true);
+    }
+
+    /// <summary>
+    /// This was made separate because now it can actually be processed from different places and not just after the dailyspin
+    /// </summary>
+    public void AllowDeeplinkProcessing()
+    {
+        EventDispatcher.TriggerEvent(new AllowMarketingEventProcessing(true));
+        ArcadeAnalyticsManager.Instance.DispatchLobbyReadyEvent();
+    }
+
+    // Triggered if we log into the same account onto another device and essentially boot this player out of their game.
+    public void OnReloadLobbyAsNewUser(IEvent evt)
+    {
+        var typedEvent = evt as ReloadLobbyAsNewUserEvent;
+        bool autoLogin = typedEvent.autoLogin;
+        AssetBundleManager.Instance.RetryAssetBundleDownload();
+        // if we're in a game, exit it.
+        EventDispatcher.TriggerEvent(new NavigationHomeEvent());
+        this.ReturnToLobby();
+        this.StopLobbySounds();
+        App.Instance.ResetUserInfo();
+        App.Instance.ConnectionHelper.DisconnectWithoutTriggeringEvent();
+
+        PopupManager.Instance.CloseAllActiveDialogs(true);
+
+        //EventDispatcher.TriggerEvent(new UserChangedEvent());
+
+        LoyaltyController.Instance.InitNewUser();
+
+        // Create and show a new title dialog
+        var dialogData = new TitleDialogData(TitleDialog.LoginTypes.ShowLoginChoice);
+        //check if autologin is set
+        if (autoLogin)
+        {
+            this.titleDialog = ShowInitialTitleDialog();
+        }
+        else
+        {
+            GameObject dialog = PopupManager.Instance.CreatePopup(DialogName.TITLE, dialogData);
+            this.titleDialog = dialog.GetComponent<TitleDialog>();
+        }
+        //don't allow any marketing events
+        EventDispatcher.TriggerEvent(new AllowMarketingEventProcessing(false));
+    }
+
+    public void OnReloadLobbyAfterDisconnect(IEvent evt)
+    {
+        PopupManager.Instance.CloseAllActiveDialogs(true);
+        LoyaltyController.Instance.InitNewUser();
+
+        // Create and show a new title dialog
+#if UNITY_WEBGL
+        var dialogData = new TitleDialogData(TitleDialog.LoginTypes.AutoLoginAsFBUser, true);
+#else
+        var dialogData = new TitleDialogData(TitleDialog.LoginTypes.ShowLoginChoice);
+#endif
+        GameObject dialog = PopupManager.Instance.CreatePopup(DialogName.TITLE, dialogData);
+        this.titleDialog = dialog.GetComponent<TitleDialog>();
+
+        // if we're in a game, exit it. (must be done after title dialog to prevent popups)
+        this.ReturnToLobby();
+        this.StopLobbySounds();
+    }
+
+    // Triggered when a ReloadLobbyEvent is thrown (when SettingsDialog is used to logout of FB account)
+    public void OnReloadLobbyAsGuest(IEvent evt)
+    {
+        // if we're in a game, exit it.
+        this.ReturnToLobby();
+        this.StopLobbySounds();;
+        LoyaltyController.Instance.InitNewUser();
+
+        // Create and show a new title dialog
+        var dialogData = new TitleDialogData(TitleDialog.LoginTypes.AutoLoginAsGuest, true);
+        GameObject dialog = PopupManager.Instance.CreatePopup(DialogName.TITLE, dialogData);
+        this.titleDialog = dialog.GetComponent<TitleDialog>();
+    }
+
+
+    // Triggered when a player uses the toggle icon on the settingsDialog to login to facebook
+    public void OnReloadLobbyAsFacebookUser(IEvent evt)
+    {
+        this.ReturnToLobby();
+        this.StopLobbySounds();
+        LoyaltyController.Instance.InitNewUser();
+        PopupManager.Instance.CloseAllActiveDialogs(true);
+        // Create and show a new title 
+        var dialogData = new TitleDialogData(TitleDialog.LoginTypes.AutoLoginAsFBUser, true);
+        GameObject dialog = PopupManager.Instance.CreatePopup(DialogName.TITLE, dialogData);
+        this.titleDialog = dialog.GetComponent<TitleDialog>();
+    }
+
+    private void OnReloadLobbyAsAppleUser(IEvent evt)
+    {
+        this.ReturnToLobby();
+        this.StopLobbySounds();
+        LoyaltyController.Instance.InitNewUser();
+        PopupManager.Instance.CloseAllActiveDialogs(true);
+        // Create and show a new title 
+        var dialogData = new TitleDialogData(TitleDialog.LoginTypes.AutoLoginAsAppleUser, true);
+        GameObject dialog = PopupManager.Instance.CreatePopup(DialogName.TITLE, dialogData);
+        this.titleDialog = dialog.GetComponent<TitleDialog>();
+    }
+
+
+    public bool IsReturnToLobbyPossible()
+    {
+        return (this.webviewHelper.IsReturnToLobbyPossible() || IsTitleDialogShowing());
+    }
+    public bool IsTitleDialogShowing()
+    {
+        return titleDialog != null;
+    }
+
+    public void ReturnToLobby(bool triggerIAMs = true)
+    {
+        ThanosLogger.Log(LogChannels.LOBBY, this + ".ReturnToLobby()");
+        // if we're in a game, exit it.
+        if (this.webviewHelper.IsReturnToLobbyPossible())
+        {
+            this.webviewHelper.ReturnToLobby();
+            if (triggerIAMs)
+            {
+                //ArcadeAnalyticsManager.Instance.DispatchLobbyScreenEvent("main");
+            }
+        }
+        EventDispatcher.TriggerEvent(new ToggleBlockInteraction(false, "ReturnToLobby"));
+        this.bottomBarManager.UnhideBottomBar();
+        StartLobbySoundsAfterReturnFromMachine();
+        object needToSendEvent = "";
+        App.Instance.GameService.KeyValueStore.UserDataDict.TryGetValue(UserDataKeys.LEVEL_UP_10_EVENT, out needToSendEvent);
+        if (level10LobbyEvent || (needToSendEvent != null && needToSendEvent.ToString() == "true"))
+        {
+            ArcadeAnalyticsManager.Instance.DispatchAppRatingEvent("level_10");
+            App.Instance.SetUserData(UserDataKeys.LEVEL_UP_10_EVENT, "false", false);
+            level10LobbyEvent = false;
+        }
+        if(bigWinLobbyEvent)
+        {
+            bigWinLobbyEvent = false;
+            ArcadeAnalyticsManager.Instance.DispatchAppRatingEvent("big_win"); 
+        }
+
+        //pop all waiting events from the asset bundle manager
+        while (pendingEvents.Count > 0)
+        {
+            EventDispatcher.TriggerEvent(pendingEvents.Dequeue());
+        }
+    }
+
+    // Triggered when the user profile has been changed (after a successful auth)
+    private void OnUserProfileUpdated(IEvent evt)
+    {
+        //null out textures that are not used
+        ClearUnusedAssets();
+        // determines if the friend button should show, refresh coins & xp
+        //this.topBarManager.UpdateView(true);
+    }
+
+    private void ClearUnusedAssets()
+    {
+        for (int i = 0; i < loadedTextures.Count; i++)
+        {
+            loadedTextures[i] = null;
+        }
+        loadedTextures.Clear();
+        Resources.UnloadUnusedAssets();
+    }
+
+    // triggered when the home button is clicked.
+    private void OnHomeButtonClicked(IEvent evt)
+    {
+        ArcadeAnalyticsManager.Instance.DispatchUIActionEvent("lobby_button", "click", "-");
+        ArcadeAnalyticsManager.Instance.DispatchLobbyScreenEvent("main");
+        this.ReturnToLobby();
+    }
+
+    private void OnBackButtonClicked(IEvent evt)
+    {
+        this.ReturnToLobby();
+    }
+
+
+    // triggered when a player returns to the lobby (from a game)
+    private void OnReturnToLobby(IEvent evt)
+    {
+        this.bottomBarManager.UnhideBottomBar();
+        this.leftBar.SetActive(false);
+    }
+
+    // triggered when a player loads a game
+    private void OnWebviewOpened(IEvent evt)
+    {
+        leftBar.SetActive(true);
+        this.StopLobbySounds();
+        EventDispatcher.TriggerEvent(new ToggleBlockInteraction(true, "OnWebviewOpened"));
+        this.bottomBarManager.HideBottomBar();
+    }
+
+
+    // Triggered when an attempt to open the store is made.
+    // This has been done so that dialog A is not responsible for telling the PopupManager to open dialog B directly.
+    private void OnTriggerOpenStore(IEvent evt)
+    {
+        var dialogData = new StoreDialogData
+        {
+            BiSource = "low_balance",
+            se3 = "-"
+        };
+        StoreManager.Instance.OpenStore(dialogData);
+    }
+
+    private void OnGameLoaded(IEvent evt)
+    {
+        EventDispatcher.TriggerEvent(new ToggleBlockInteraction(false, "OnGameLoaded"));
+    }
+
+    public TopBarManager GetTopBarManager()
+    {
+        return this.topBarManager;
+    }
+
+    public BottomBarManager GetBottomBarManager()
+    {
+        return this.bottomBarManager;
+    }
+
+    public TitleDialog GetTitleDialog(){
+        return titleDialog;
+    }
+
+    private void OnRVAShow(IEvent evt)
+    {
+        ThanosLogger.Log(LogChannels.ADS, this + ".OnRVAShow()");
+        this.wasSoundMutedPriorToRVA = AudioManager.Instance.IsMuted();
+        // if the sfx is not muted, 
+        if (!this.wasSoundMutedPriorToRVA)
+        {
+            AudioManager.Instance.SetMute(true);
+        }
+    }
+
+    private void OnRVASuccess(IEvent evt)
+    {
+        ThanosLogger.Log(LogChannels.ADS, this + ".OnRVASuccess()");
+        //this.RestoreSoundAfterRVA();
+    }
+
+    private void OnRVAFail(IEvent evt)
+    {
+        ThanosLogger.Log(LogChannels.ADS, this + ".OnRVAFail()");
+        this.RestoreSoundAfterRVA();
+    }
+
+    private void OnRVAClosed(IEvent evt)
+    {
+        ThanosLogger.Log(LogChannels.ADS, this + ".OnRVACancel()");
+        this.RestoreSoundAfterRVA();
+    }
+
+
+
+    // Set the sound muting back to what it was prior to playing (or attempting) a RVA.
+    private void RestoreSoundAfterRVA()
+    {
+        if (!this.wasSoundMutedPriorToRVA)
+        {
+            AudioManager.Instance.SetMute(false);
+        }
+        this.wasSoundMutedPriorToRVA = false;  // reset to default
+    }
+
+    public void ScrimLobbyBars(bool active)
+    {
+        bottomBarManager.ScrimBottomBar(active);
+        topBarManager.ScrimTopBar(active);
+    }
+
+#if UNITY_WEBGL
+    public void ExecuteWebglJS(string executable)
+    {
+        webviewHelper.ExecuteWebGlJS(executable);
+    }
+#endif
+
+
+#region Scale and Notch Handling
+
+    public float GetScreenSafeAreaXPosition()
+    {
+        //Since Android doesnt render behind the notch, it needs to be ignored.
+#if UNITY_ANDROID
+        return 0;
+#endif
+        if (Screen.safeArea.x > 0)
+        {
+            ThanosLogger.Log(LogChannels.LOBBY, "Notch detected for this device");
+        }
+        else
+        {
+            ThanosLogger.Log(LogChannels.LOBBY, "No Notch detected for this device");
+        }
+        return Screen.safeArea.x;
+    }
+    public bool IsWeirdScale()
+    {
+        return ((float)Screen.width / Screen.height > (16f/9f)+0.1f);
+    }
+
+    //ipads and samsung tablets
+    public bool IsShortScale()
+    {
+        return ((float)Screen.width / Screen.height < (5f/3f)+0.1f);
+    }
+
+    public bool IsIPad()
+    {
+        if(SystemInfo.deviceModel.StartsWith("iPad"))
+        {
+            return true;
+        }
+
+        return ((float)Screen.width / Screen.height <= (4f/3f)+0.1f);
+    }
+
+    public bool IsIphone8AndUp()
+    {
+        switch (SystemInfo.deviceModel)
+        {
+            case "iPhone10,1": // Iphone 8
+            case "iPhone10,4": // Iphone 8
+            case "iPhone10,2": // Iphone 8 Plus
+            case "iPhone10,5": // Iphone 8 Plus
+            case "iPhone10,3": // Iphone X
+            case "iPhone10,6": // Iphone X
+            case "iPhone11,2": //iPhone XS
+            case "iPhone11,4"://iPhone XS Max
+            case "iPhone11,6":// iPhone XS Max Global
+            case "iPhone11,8"://iPhone XR
+            case "iPhone12,1": // iPhone 11
+            case "iPhone12,3": // iPhone 11 Pro
+            case "iPhone12,5": // iPhone 11 Pro Max
+            case "iPhone12,8": // iPhone SE 2nd Gen
+            case "iPhone13,1": // iPhone 12 Mini
+            case "iPhone13,2": // iPhone 12
+            case "iPhone13,3": // iPhone 12 Pro
+            case "iPhone13,4": // iPhone 12 Pro Max
+            case "iPhone14,2": // iPhone 13 Pro
+            case "iPhone14,3": // iPhone 13 Pro Max
+            case "iPhone14,4": // iPhone 13 Mini
+            case "iPhone14,5": // iPhone 13
+                {
+                    return true;
+                }
+            default:
+                return false;
+        }
+    }
+
+    public bool IsIphoneXAndUp()
+    {
+        switch (SystemInfo.deviceModel)
+        {
+            case "iPhone10,3": // Iphone X
+            case "iPhone10,6": // Iphone X
+            case "iPhone11,2": //iPhone XS
+            case "iPhone11,4"://iPhone XS Max
+            case "iPhone11,6":// iPhone XS Max Global
+            case "iPhone11,8"://iPhone XR
+            case "iPhone12,1": // iPhone 11
+            case "iPhone12,3": // iPhone 11 Pro
+            case "iPhone12,5": // iPhone 11 Pro Max
+            case "iPhone12,8": // iPhone SE 2nd Gen
+            case "iPhone13,1": // iPhone 12 Mini
+            case "iPhone13,2": // iPhone 12
+            case "iPhone13,3": // iPhone 12 Pro
+            case "iPhone13,4": // iPhone 12 Pro Max
+            case "iPhone14,2": // iPhone 13 Pro
+            case "iPhone14,3": // iPhone 13 Pro Max
+            case "iPhone14,4": // iPhone 13 Mini
+            case "iPhone14,5": // iPhone 13
+                {
+                    return true;
+                }
+            default:
+                return false;
+        }
+    }
+
+    public void SetupPopupCanvasScale()
+    {
+        if (IsIphone8AndUp() || IsWeirdScale())
+        {
+            popupCanvas.matchWidthOrHeight = 1;
+        }
+        else
+        {
+            popupCanvas.matchWidthOrHeight = 0;
+        }
+    }
+#endregion
+
+    private void OnChallengeProcessed(IEvent evt)
+    {
+        //var evt2 = evt as ChallengeProcessedEvent;
+        //DailyChallengeController.CurrentChallengeDetails challengeDetails = evt2.challengeDetails;
+        //StartCoroutine(HandleChallengeDetails(challengeDetails));
+    }
+
+    private void OnLevelUpEvent(IEvent evt)
+    {
+        var typedEvent = evt as LevelUpEvent;
+        App.Instance.GameService.LevelInfo.GetLevelInfo(typedEvent.newRank, this.OnGetLevelInfoSuccess, this.OnGetLevelInfoFail);
+        if (typedEvent.newRank == 10)
+        {
+           level10LobbyEvent =  true;
+           App.Instance.SetUserData(UserDataKeys.LEVEL_UP_10_EVENT, "true", false);
+        }
+    }
+
+    private void OnGetLevelInfoSuccess(IAsyncResult result, GameService.LevelInfoAPI.LevelInfoResponse response)
+    {
+        var games = GameDataManager.Instance.GetGamesByUnlockLevelAndTime(App.Instance.UserInfo.XpLevel);
+        ArcadeAnalyticsManager.Instance.DispatchCurrencyAddEvent("level_up", AnalyticsConstants.COINS, response.LevelUpCoins.ToString(), "-", "-", "-");
+        App.Instance.LeanplumForceContentUpdate();
+        List<GameService.StoreAPI.StoreInfo.StoreBooster> boosterList = new List<GameService.StoreAPI.StoreInfo.StoreBooster>();
+        if (response.Boosters != null)
+        {
+            boosterList.AddRange(response.Boosters);
+        }
+        var data = new LevelUpMomentData()
+        {
+            CoinReward = Convert.ToInt32(response.LevelUpCoins),
+            Games = RemoveGamesWithNoIconsDownloaded(games),
+            RewardAutoDismissMS = (float)App.Instance.CasinoConfig.levelUpConfig.ChipDialogDismissTimerMS,
+            GameAutoDismissMS = (float)App.Instance.CasinoConfig.levelUpConfig.GameDialogDismissTimerMS,
+            Boosters = boosterList,
+            LoyaltyPoints = response.LevelUpLoyaltyPoints
+        };
+        PopupManager.Instance.CreateQueuedPopup(DialogName.LEVEL_UP_MOMENT, data, OnLevelUpMomentClosed); 
+    }
+
+    private void OnLevelUpMomentClosed()
+    {
+        EventDispatcher.TriggerEvent(new ToggleForceReloadDialogBlock(false));
+    }
+
+    private List<CoreGameInfo.Games>  RemoveGamesWithNoIconsDownloaded(List<CoreGameInfo.Games> games)
+    {
+        List<CoreGameInfo.Games> newList = new List<CoreGameInfo.Games>();
+        foreach (CoreGameInfo.Games game in games )
+        {
+            var sprites = AssetBundleManager.Instance.GetSpritesById(game.Id);
+            if (sprites != null)
+            {
+                newList.Add(game);
+            }
+        }
+        return newList;
+    }
+
+    private void OnGetLevelInfoFail(IAsyncResult result, string errorMsg)
+    {
+        EventDispatcher.TriggerEvent(new ToggleForceReloadDialogBlock(false));
+        ThanosLogger.Error(this + ".OnGetLevelInfoFail: " + errorMsg);
+    }
+
+    //private IEnumerator HandleChallengeDetails(DailyChallengeController.CurrentChallengeDetails challengeDetails)
+    //{
+    //    List<Sprite> buttonSpritesList = new List<Sprite>(3);
+    //    List<Sprite> logoSpritesList = new List<Sprite>(3);
+    //    // Find game names to download
+    //    for (int i = 0; i < challengeDetails.objectives.Count; i++)
+    //    { 
+    //        DailyChallengeController.CurrentChallengeObjectiveDetails objective = challengeDetails.objectives[i];
+    //        foreach (string name in objective.gameNames)
+    //        {
+    //            // Get Icons
+    //            //string gameId = lobbyButtonsView.LookupGameId(name);
+    //            //buttonSpritesList.Insert(i, LookupMachineSquareIcon(gameId));
+    //            //logoSpritesList.Insert(i, LookupMachineSquareName(gameId));
+    //            break;
+    //        }
+    //    }
+    //    this.rightBar.GetDailyChallengeController().SetObjectiveBoxTextures(buttonSpritesList, logoSpritesList);
+    //    yield break;
+    //}
+
+    //private IEnumerator DownloadChallengeImage(string imageURL, string gameName, bool isLogo, System.Action<bool> callback)
+    //{
+    //    using (UnityWebRequest uwr = UnityWebRequestTexture.GetTexture(imageURL))
+    //    {
+    //        yield return uwr.SendWebRequest();
+    //        if (uwr.result != UnityWebRequest.Result.Success)
+    //        {
+    //            ThanosLogger.Error(this + ".DownloadChallengeImage encountered error: " + uwr.error + " downloading " + imageURL);
+    //            callback(false);
+    //        }
+    //        else
+    //        {
+    //            if (DownloadHandlerTexture.GetContent(uwr) != null)
+    //            {
+    //                Texture2D tex = DownloadHandlerTexture.GetContent(uwr);
+    //                if (isLogo)
+    //                {
+    //                    squareLogoTextures[gameName] = tex;
+    //                }
+    //                else
+    //                {
+    //                    squareButtonTextures[gameName] = tex;
+    //                }
+    //                callback(true);
+    //            }
+    //        }
+    //    }
+    //    yield break;
+    //}
+
+#if UNITY_ANDROID || UNITY_IOS
+    public void OnLowMemory()
+    {
+        ArcadeAnalyticsManager.Instance.DispatchLowMemoryEvent();
+        Resources.UnloadUnusedAssets();
+    }
+#endif
+}
