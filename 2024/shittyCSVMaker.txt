@@ -1,0 +1,126 @@
+using UnityEngine;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+
+[System.Serializable]
+public struct Benchmark
+{
+    public string name;
+    public Dictionary<string, BundleLoadTimeEntry> bundles;
+}
+[System.Serializable]
+public struct BundleLoadTimeEntry
+{
+    public string bundleName;
+    public float timeTaken;
+    public Dictionary<string, AssetLoadTimeEntry> assets;
+}
+[System.Serializable]
+public struct AssetLoadTimeEntry
+{
+    public string assetName;
+    public float timeTaken;
+}
+public abstract class BenchmarkingFunctions : MonoBehaviour
+{
+    protected string ConvertToCSV(Benchmark benchmark)
+    {
+        StringBuilder csvBuilder = new StringBuilder();
+        csvBuilder.AppendLine($"{benchmark.name} Benchmark"); // Header
+
+        csvBuilder.AppendLine("Bundle Name,Load Time"); // Header
+
+        foreach (var bundle in benchmark.bundles)
+        {
+            csvBuilder.AppendLine($"{bundle.Value.bundleName},{bundle.Value.timeTaken.ToString("0.000000")}");
+            csvBuilder.AppendLine("Asset Name,Load Time"); // Header
+            foreach (var asset in bundle.Value.assets)
+            {
+                csvBuilder.AppendLine($"{asset.Value.assetName},{asset.Value.timeTaken.ToString("0.000000")}");
+            }
+        }
+
+        return csvBuilder.ToString();
+    }
+
+    protected void SaveCSVToFile(string csv, string path)
+    {
+        try
+        {
+            File.WriteAllText(path, csv);
+            Debug.Log("CSV saved to: " + path);
+        }
+        catch (IOException e)
+        {
+            Debug.LogError("Failed to save CSV to file: " + e.Message);
+
+        }
+    }
+    protected float FormatTimeElapsed(float timeElapsed)
+    {
+        // Convert to milliseconds and round to four decimal places for more accuracy
+        float milliseconds = timeElapsed * 1000f;
+        return Mathf.Round(milliseconds * 10000f) / 10000f;
+    }
+
+}
+public class BenchmarkingHelper : BenchmarkingFunctions
+{
+    Benchmark _currentBenchmark;
+    public void Setup(string benchmarkName)
+    {
+        _currentBenchmark = new Benchmark()
+        {
+            name = benchmarkName,
+            bundles = new Dictionary<string, BundleLoadTimeEntry>()
+        };
+
+    }
+    public void AddSection(string sectionName)
+    {
+        if (!_currentBenchmark.bundles.ContainsKey(sectionName))
+        {
+            _currentBenchmark.bundles[sectionName] = new BundleLoadTimeEntry
+            {
+                bundleName = sectionName,
+                timeTaken = 0f,
+                assets = new Dictionary<string, AssetLoadTimeEntry>()
+            };
+        }
+    }
+    public void RecordBundleLoadTime(string bundleName, float timeTaken)
+    {
+        var bundleEntry = new BundleLoadTimeEntry()
+        {
+            bundleName = bundleName,
+            timeTaken = (timeTaken),
+            assets = new Dictionary<string, AssetLoadTimeEntry>()
+        };
+        _currentBenchmark.bundles.Add(bundleName, bundleEntry);
+    }
+    public void RecordAssetLoadTime(string bundleName, string assetName, float timeTaken)
+    {
+        if (!_currentBenchmark.bundles.ContainsKey(bundleName))
+            _currentBenchmark.bundles.Add(bundleName, new BundleLoadTimeEntry() { bundleName = bundleName, assets = new Dictionary<string, AssetLoadTimeEntry>() });
+
+        var bundle = _currentBenchmark.bundles[bundleName];
+        if (!bundle.assets.ContainsKey(assetName))
+        {
+            var bundleEntry = new AssetLoadTimeEntry()
+            {
+                assetName = assetName,
+                timeTaken = (timeTaken)
+            };
+            bundle.assets.Add(assetName, bundleEntry);
+            _currentBenchmark.bundles[bundleName] = bundle;
+        }
+
+    }
+    public void Save()
+    {
+
+        string csv = ConvertToCSV(_currentBenchmark);
+        SaveCSVToFile(csv, $"Assets/{_currentBenchmark.name}.csv");
+    }
+}
